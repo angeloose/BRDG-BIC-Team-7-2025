@@ -15,6 +15,15 @@
 ├──vision/
 ├──scripts/
 
+├── codeExamples
+├── Jetson Vision
+├── mainProject
+├── resources
+└── Servo Controller
+    ├── docs
+    ├── Prototype_1_nucleo_f0
+    └── reference
+
 
 ## Acknowledgements
 - BRDG Showcase Mentors
