@@ -11,11 +11,7 @@
 ### Team Members
 
 ### Repository Structure
-├──firmware/ # STM32 Control Code
-├──vision/
-├──scripts/
-
-├── codeExamples
+├── codeExamples\
 ├── Jetson Vision
 ├── mainProject
 ├── resources
