@@ -36,6 +36,7 @@
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
+/* ===================== HiWonder I2C Driver Helpers ===================== *
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
@@ -58,6 +59,95 @@ I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
+
+
+typedef enum { HIW_PROTO_UNKNOWN=0, HIW_PROTO_A, HIW_PROTO_B } hiw_proto_t;
+
+static uint8_t   g_hiw_addr7  = 0x34;      // will be updated by scan
+static hiw_proto_t g_hiw_proto = HIW_PROTO_UNKNOWN;
+
+/* Scan I2C bus for a likely motor driver address (0x30/0x32 common). */
+static uint8_t hiw_scan_bus(void) {
+  uint8_t found = 0;
+  for (uint8_t a = 1; a < 127; ++a) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, a<<1, 1, 5) == HAL_OK) {
+      g_hiw_addr7 = a;
+      found = 1;
+      break;
+    }
+  }
+  return found;
+}
+
+/* Convenience: write "reg, value" pair. */
+static HAL_StatusTypeDef hiw_write_reg(uint8_t reg, uint8_t val) {
+  uint8_t buf[2] = {reg, val};
+  return HAL_I2C_Master_Transmit(&hi2c1, g_hiw_addr7<<1, buf, 2, 10);
+}
+
+/* Map [-100..100] to {dir,mag} with mag in [0..255]. */
+static inline void sp_to_dir_mag(int8_t pct, uint8_t *dir, uint8_t *mag) {
+  int16_t m = (int16_t)((pct < 0 ? -pct : pct) * 2.55f); // 0..255
+  if (m > 255) m = 255;
+  *mag = (uint8_t)m;
+  *dir = (pct >= 0) ? 1 : 0; // 1=fwd, 0=rev (adjust if your board flips)
+}
+
+/* ---------- Protocol A: separate DIR/SPEED registers per motor ----------
+   Guess: M1 dir=0x00, speed=0x01; M2 dir=0x02, speed=0x03.
+   Many simple dual drivers use this mapping. */
+static HAL_StatusTypeDef hiwA_set(uint8_t motor, int8_t pct) {
+  uint8_t dir, mag; sp_to_dir_mag(pct, &dir, &mag);
+  uint8_t reg_dir   = (motor==1) ? 0x00 : 0x02;
+  uint8_t reg_speed = (motor==1) ? 0x01 : 0x03;
+  if (hiw_write_reg(reg_dir, dir)   != HAL_OK) return HAL_ERROR;
+  if (hiw_write_reg(reg_speed, mag) != HAL_OK) return HAL_ERROR;
+  return HAL_OK;
+}
+
+/* ---------- Protocol B: packed command [cmd, motorId, dir, speed] -------
+   Some HiWonder boards do: cmd=0x01, motorId ∈ {1,2}. */
+static HAL_StatusTypeDef hiwB_set(uint8_t motor, int8_t pct) {
+  uint8_t dir, mag; sp_to_dir_mag(pct, &dir, &mag);
+  uint8_t pkt[4] = {0x01, motor, dir, mag};
+  return HAL_I2C_Master_Transmit(&hi2c1, g_hiw_addr7<<1, pkt, 4, 10);
+}
+
+/* Try both patterns with a harmless "speed = 0" to see which ACKs. */
+static void hiw_detect_protocol(void) {
+  g_hiw_proto = HIW_PROTO_UNKNOWN;
+  // Try Protocol A
+  if (hiwA_set(1, 0) == HAL_OK && hiwA_set(2, 0) == HAL_OK) {
+    g_hiw_proto = HIW_PROTO_A;
+    return;
+  }
+  // Try Protocol B
+  if (hiwB_set(1, 0) == HAL_OK && hiwB_set(2, 0) == HAL_OK) {
+    g_hiw_proto = HIW_PROTO_B;
+    return;
+  }
+}
+
+/* Public: set speed in percent [-100..100]; motor 1=left, 2=right. */
+static void hiw_set_speed(uint8_t motor, int8_t pct) {
+  if (g_hiw_proto == HIW_PROTO_A) { hiwA_set(motor, pct); return; }
+  if (g_hiw_proto == HIW_PROTO_B) { hiwB_set(motor, pct); return; }
+  // Unknown → do nothing (or try both)
+}
+
+/* Optional: stop both motors. */
+static void hiw_stop_all(void) {
+  hiw_set_speed(1, 0);
+  hiw_set_speed(2, 0);
+}
+
+/* Quick functional test: forward then reverse slowly. */
+static void hiw_quick_test(void) {
+  for (int i=0;i<15;i++){ hiw_set_speed(1, 20); hiw_set_speed(2, 20); HAL_Delay(50); }
+  HAL_Delay(400);
+  for (int i=0;i<15;i++){ hiw_set_speed(1,-20); hiw_set_speed(2,-20); HAL_Delay(50); }
+  hiw_stop_all();
+}
 
 /* USER CODE BEGIN PV */
 
@@ -141,7 +231,23 @@ int main(void)
   MX_SPI1_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
+
+  hiw_scan_bus();         // finds the I2C address (e.g., 0x30 / 0x32)
+   hiw_detect_protocol();
+   hiw_set_speed(1, 30);   // left ~30%
+    hiw_set_speed(2, 30);   // right ~30%
+    HAL_Delay(1000);
+    hiw_stop_all();
   /* USER CODE BEGIN 2 */
+  /* ---- HiWonder bring-up ---- */
+/*  if (!hiw_scan_bus()) {
+    // No I2C device responded; check wiring/power/pull-ups
+    // (Optionally print via UART here)
+  }
+  hiw_detect_protocol();
+  // Optional one-time motion check (lift tracks off table!)
+  // hiw_quick_test();
+
   csn_high();
   ce_low();
 
@@ -158,10 +264,10 @@ int main(void)
 ce_high();
 nrf24_listen();
 
-/* State */
+
  uint32_t last_rx_ms = HAL_GetTick();
  // If you later add motors, keep ramped outputs here:
- int8_t Lout = 0, Rout = 0;
+ int8_t Lout = 0, Rout = 0; */
 
 //uint8_t rx[PLD_SIZE] = {0};
 //#ifdef tx
@@ -177,76 +283,116 @@ nrf24_listen();
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if (nrf24_data_available())
+	  /*if (nrf24_data_available())
 	      {
 	        ControlPkt p = {0};
 	        nrf24_receive((uint8_t*)&p, sizeof(p));
 
-	        /* Validate */
+	        /* Validate
 	        if (p.hdr != 0xAA) goto after_packet;
 	        if (crc8((uint8_t*)&p, 5) != p.crc) goto after_packet;
 
 	        last_rx_ms = HAL_GetTick();
 
-	        /* E-stop flag? */
+	        /* E-stop flag?
 	        if (p.flags & 0x01) {
 	          // TODO: drive motors: hiw_set_speed(1,0); hiw_set_speed(2,0);
+	        	hiw_stop_all();
 	          Lout = Rout = 0;
 	          // quick flash to indicate e-stop
 	          for (int i=0;i<3;i++){ HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); HAL_Delay(60); }
 	          continue;
 	        }
 
-	        /* Convert to floats in [-1..1] */
+	        /* Convert to floats in [-1..1]
 	        float v = ((float)p.vx) / 127.0f;   // forward/back
 	        float w = ((float)p.wz) / 127.0f;   // turn
 
-	        /* Tank mix */
+	        /* Tank mix
 	        float L = clampf(v + w, -1.0f, 1.0f);
 	        float R = clampf(v - w, -1.0f, 1.0f);
 
-	        /* First-run limit (raise later) */
+	        /* First-run limit (raise later)
 	        const float LIMIT = 0.60f;
 	        L = clampf(L, -LIMIT, LIMIT);
 	        R = clampf(R, -LIMIT, LIMIT);
 
-	        /* Map to -100..100 (for your motor driver later) */
+	        /* Map to -100..100 (for your motor driver later)
 	        int8_t Ltgt = (int8_t)lrintf(L * 100.0f);
 	        int8_t Rtgt = (int8_t)lrintf(R * 100.0f);
 
-	        /* Optional ramping (comment out if not needed yet) */
+	        /* Optional ramping (comment out if not needed yet)
 	        Lout = ramp(Lout, Ltgt, 3);
 	        Rout = ramp(Rout, Rtgt, 3);
 
+   #define LEFT_INVERT   0
+   #define RIGHT_INVERT  0
+   int8_t Lsend = LEFT_INVERT  ? (int8_t)-Lout : Lout;
+   int8_t Rsend = RIGHT_INVERT ? (int8_t)-Rout : Rout;
+
+   // Requires you added hiw_set_speed() helpers earlier
+   hiw_set_speed(1, Lsend);  // M1 = left
+   hiw_set_speed(2, Rsend);
+
 	        /* TODO: send to motor driver over I2C here
-	           hiw_set_speed(1, Lout);
-	           hiw_set_speed(2, Rout);
-	        */
+	          hiw_set_speed(1, Lout);
+	           hiw_set_speed(2, Rout); */
 
 	        /* For now: LED indicates packets — blink faster with more forward */
-	        uint32_t base = 400;
-	        uint32_t delta = (uint32_t)(fabsf(v) * 300.0f);
-	        uint32_t delayMs = base - delta;
-	        if (w > 0.15f) HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-	        else           HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-	        HAL_Delay(delayMs);
+	        //uint32_t base = 400;
+	        //uint32_t delta = (uint32_t)(fabsf(v) * 300.0f);
+	        //uint32_t delayMs = base - delta;
+	       // if (w < 0.15f) HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+	      //  else           HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	        //HAL_Delay(60);
+	        /* LED behavior:
+	           - Forward  (v > +deadband): solid ON
+	           - Reverse  (v < -deadband): flash (blink)
+	           - Neutral  (|v| <= deadband): OFF
+	           This ignores 'w' entirely.
+
+	        const float deadband = 0.05f;        // tweak if needed
+	        static uint32_t lastBlinkMs = 0;
+	        static uint8_t  blinkState = 0;
+
+	        if (v >  deadband) {
+	          // Forward: solid ON
+	        	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	        } else if (v < -deadband) {
+	          // Reverse: flashing (faster with more reverse)
+	          uint32_t now = HAL_GetTick();
+	          uint32_t base = 300;                              // ms at gentle reverse
+	          uint32_t delta = (uint32_t)(fabsf(v) * 200.0f);   // speed up as |v| grows
+	          uint32_t period = (base > delta) ? (base - delta) : 50; // floor at 50 ms
+
+	          if (now - lastBlinkMs >= period) {
+	            lastBlinkMs = now;
+	            blinkState ^= 1;
+	            if (blinkState) HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	            else HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+	          }
+	        } else {
+	          // Neutral: OFF
+	        	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+	        }
+
 	      }
 
 	  after_packet:
-	      /* Link-loss watchdog: stop if no packet for 300 ms */
+	      /* Link-loss watchdog: stop if no packet for 300 ms
 	      if (HAL_GetTick() - last_rx_ms > 300) {
 	        if (Lout || Rout) {
-	          Lout = Rout = 0;
-	          // TODO: drive motors: hiw_set_speed(1,0); hiw_set_speed(2,0);
+	          Lout = Rout = 0; hiw_stop_all();
+	          /* TODO: drive motors: hiw_set_speed(1,0); hiw_set_speed(2,0);
+	          hiw_set_speed(1,0); hiw_set_speed(2,0);
 	        }
-	        // Slow blink to show we’re waiting for link
+	        // Slow blink to show we’re waiting for link*/
 	        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 	        HAL_Delay(250);
 	      }
 	    }
-	  }
-
-//#ifdef rx
+	  //}
+	  //#ifdef rx
 
 //(nrf24_receive(data_R, sizeof(data_R));
 
